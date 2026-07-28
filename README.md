@@ -10,6 +10,16 @@ raw WAVs  --->  feature extraction  --->  model training  --->  inference
 
 ---
 
+## Dataset
+
+**TRACE** (Text-speech Realism and Authenticity Corpus Evaluation) — the dataset used to train and evaluate this pipeline — is publicly available on Hugging Face:
+
+[SathvikNapa/TRACE](https://huggingface.co/datasets/SathvikNapa/TRACE)
+
+8,434 labeled dyadic pairs across four augmentation conditions (`original`, `original_vc`, `emotivoice_tts`, `emotivoice_tts_vc`), split into train (5,131) and test (3,303) sets. License: CC BY-NC 4.0.
+
+---
+
 ## Dependencies
 
 **Python packages**
