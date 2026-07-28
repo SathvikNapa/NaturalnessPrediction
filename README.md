@@ -10,13 +10,31 @@ raw WAVs  --->  feature extraction  --->  model training  --->  inference
 
 ---
 
+## Pretrained Weights
+
+All checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing). Download the subfolder matching your desired feature set and model.
+
+| Feature set | Input modality | `crossattn` | `llama` | `mlp` | `dyadformer` |
+|---|---|:---:|:---:|:---:|:---:|
+| `speech_only` | Audio only | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | — | — |
+| `speech_rel` | Audio + relationship text | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | — | — |
+| `speech_context` | Audio + context + roles | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) |
+| `speech_context_rel` | Audio + context + roles + relationship | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) | [↓](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing) |
+
+Each folder contains `best_model.pt` (best validation accuracy) and `last_model.pt` (final epoch). The Drive root is `SLT_naturalness_ablation/`; subdirectory names map as: `trace_crossencoder` → `crossattn`, `trace_latefusion` → `llama`.
+
+---
+
 ## Dataset
 
-**TRACE** (Text-speech Realism and Authenticity Corpus Evaluation) — the dataset used to train and evaluate this pipeline — is publicly available on Hugging Face:
+**TRACE** (Text-speech Realism and Authenticity Corpus Evaluation) is available on [Hugging Face](https://huggingface.co/datasets/SathvikNapa/TRACE). 8,434 labeled dyadic pairs split into train (5,131) and test (3,303). License: CC BY-NC 4.0.
 
-[SathvikNapa/TRACE](https://huggingface.co/datasets/SathvikNapa/TRACE)
-
-8,434 labeled dyadic pairs across four augmentation conditions (`original`, `original_vc`, `emotivoice_tts`, `emotivoice_tts_vc`), split into train (5,131) and test (3,303) sets. License: CC BY-NC 4.0.
+| Augmentation type | Description | Label | Train pairs | Test pairs |
+|---|---|:---:|:---:|:---:|
+| [`original`](https://huggingface.co/datasets/SathvikNapa/TRACE) | Unmodified naturalistic speech | 1 — natural | 1,295 | 830 |
+| [`original_vc`](https://huggingface.co/datasets/SathvikNapa/TRACE) | Naturalistic speech with voice conversion applied | 0 — unnatural | 1,288 | 825 |
+| [`emotivoice_tts`](https://huggingface.co/datasets/SathvikNapa/TRACE) | Speaker B replaced with contrastive-emotion TTS | 0 — unnatural | 1,295 | 830 |
+| [`emotivoice_tts_vc`](https://huggingface.co/datasets/SathvikNapa/TRACE) | TTS Speaker B additionally voice-converted | 0 — unnatural | 1,253 | 818 |
 
 ---
 
@@ -295,46 +313,6 @@ torchrun --nproc_per_node=4 infer.py \
 `row_idx`, `p1_base`, `p2_base`, `p1_path`, `p2_path`, `label`, `augmentation_type`, `rel_detail`, `high_level_context`, `probability`, `prediction`, `logit`, `error`
 
 Rows where embeddings are missing receive `error="missing_embeddings"` rather than crashing the run.
-
----
-
-## Pretrained Weights
-
-[Download weights from Google Drive](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing)
-
-The archive is organised by feature ablation group and model architecture:
-
-```
-SLT_naturalness_ablation/
-├── speech_only/
-│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
-│   └── trace_latefusion/{best_model.pt, last_model.pt}
-├── speech_rel/
-│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
-│   └── trace_latefusion/{best_model.pt, last_model.pt}
-├── speech_context/
-│   ├── dyadformer/{best_model.pt, last_model.pt}
-│   ├── mlp/{best_model.pt, last_model.pt}
-│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
-│   └── trace_latefusion/{best_model.pt, last_model.pt}
-└── speech_context_rel/
-    ├── dyadformer/{best_model.pt, last_model.pt}
-    ├── mlp/{best_model.pt, last_model.pt}
-    ├── trace_crossencoder/{best_model.pt, last_model.pt}
-    └── trace_latefusion/{best_model.pt, last_model.pt}
-```
-
-Directory names encode the feature set (`speech_only` | `speech_rel` | `speech_context` | `speech_context_rel`) and the model architecture (`trace_crossencoder` = `crossattn`, `trace_latefusion` = `llama`, `dyadformer` = `llama`, `mlp`).
-
-Loading a checkpoint with `infer.py`:
-
-```bash
-python infer.py \
-    --checkpoint weights/speech_context_rel/trace_crossencoder/best_model.pt \
-    --embed-root /path/to/embeddings/embeds_vec \
-    --input-csv  data/test.csv \
-    --output-csv results/predictions.csv
-```
 
 ---
 
