@@ -1,11 +1,41 @@
 #!/usr/bin/env python3
 """
-Output Files Generated:
+naturalness_transformer_llama_ddp_lazy_cached_features_w_modeltype_flags_naming_noctx_crossattn.py
+
+Dyadic-embeddings workflow trainer (CSV with two participant wav path columns)
++ optional auxiliary features (cats + context text + relationship text).
+
+MODELS / METHODS:
+  - base_transformer : nn.TransformerEncoder + sinusoidal PE (audio encoder) + concat aux
+  - llama            : RoPE + SwiGLU (LLaMA-ish) encoder + concat aux
+  - crossattn        : LLaMA-ish audio tokens + AUX token cross-attends to audio tokens
+  - mlp              : masked mean pool + MLP (+ optional aux)
+  - logreg           : masked mean pool + linear (+ optional aux)
+
+Backward compat:
+  --model-type transformer  == llama
+
+ATTENTION DUMPING (rank0 only):
+  --dump-attn
+  --attn-out <dir>                 (default: <out_dir>/attn)
+  --attn-max-batches <int>         (default: 50)
+  --attn-mode {mean_query, last_query}  (default: mean_query)
+
+What gets dumped:
+  For crossattn:
+    per-layer attention reduced to [B, T] (mean over heads; query is the aux token)
+  For llama:
+    per-layer self-attn reduced to [B, T] by:
+      - mean over heads
+      - either mean over query positions (mean_query) OR last query position (last_query)
+      - masked + renormalized
+
+Files:
   <out_dir>/test_predictions.csv
   <out_dir>/test_misclassified.csv
   <out_dir>/test_metrics.json
-  <out_dir>/attn/attn_batches.pt
-  <out_dir>/attn/attn_summary.json
+  <out_dir>/attn/attn_batches.pt              (rank0; limited by --attn-max-batches)
+  <out_dir>/attn/attn_summary.json            (rank0)
 """
 
 from __future__ import annotations
@@ -21,6 +51,7 @@ import random
 import re
 import time
 from collections import OrderedDict, defaultdict
+from datetime import timedelta
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,28 +64,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from torch.amp import autocast as _autocast
-    from torch.amp import GradScaler as _GradScaler
+    from torch.amp import autocast as _autocast  # type: ignore
+    from torch.amp import GradScaler as _GradScaler  # type: ignore
 
     def autocast(enabled: bool = True):
         return _autocast(device_type="cuda", enabled=enabled)
 
     GradScaler = _GradScaler
 except Exception:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.cuda.amp import autocast, GradScaler  # type: ignore
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from sklearn.metrics import classification_report, confusion_matrix, brier_score_loss
+from sklearn.metrics import classification_report, confusion_matrix, brier_score_loss, f1_score
 
+# Silence HF tokenizers fork warnings
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-MIN_REAL_PAIRS = 10
+MIN_REAL_PAIRS = 10  # at least 10 chunks per speaker (after skipping corrupt)
 
 
+# -----------------------------
+# Utils: DDP
+# -----------------------------
 def ddp_is_available() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -85,7 +120,7 @@ def setup_ddp_from_env() -> Tuple[bool, int, int]:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
+        dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(hours=2))
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         return True, rank, local_rank
@@ -108,22 +143,29 @@ def broadcast_bool(flag: bool) -> bool:
 
 
 def _kpm_from_lengths(lengths: torch.Tensor, T: int) -> torch.Tensor:
+    # True means PAD
     rng = torch.arange(T, device=lengths.device)[None, :]
     return rng >= lengths[:, None]
 
 
-
+# -----------------------------
+# Hyperparams
+# -----------------------------
 @dataclass
 class HyperParams:
     train_csv: str = ""
     test_csv: str = ""
-    val_csv: str = ""
+    val_csv: str = ""  # optional
 
-    embed_root: str = ""
+    embed_root: str = ""  # points to embeds_vec OR embeds_seq (recursive scan)
     out_dir: str = ""
 
+    # model type
+    # base_transformer | llama | crossattn | mlp | logreg
+    # alias: transformer -> llama
     model_type: str = "llama"
 
+    # CSV columns (match YOUR dataset)
     p1_path_col: str = "participant1_relpath_abs"
     p2_path_col: str = "participant2_relpath_abs"
     label_col: str = "naturalness"
@@ -132,51 +174,66 @@ class HyperParams:
     speaker_a_role_col: str = "speaker_a_role"
     speaker_b_role_col: str = "speaker_b_role"
 
+    # Feature toggles
     use_cats: bool = True
     use_context: bool = True
     use_rel_text: bool = True
     speech_only: bool = False
 
+    # relationship text embedding
     rel_text_template: str = "{speaker_a_role} [SEP] {speaker_b_role} [SEP] {rel_detail}"
-    rel_text_cache: str = ""
+    rel_text_cache: str = ""  # if empty, <out_dir>/relationship_hf_cache.pkl
 
+    # windowing
     max_seq_len: int = 512
-    window_strategy: str = "head"
+    window_strategy: str = "head"  # head | random
 
-    val_split: float = 0.0
+    # splits
+    val_split: float = 0.0  # default NO validation unless you ask for it
 
+    # optimization
     batch_size: int = 16
     num_epochs: int = 20
     lr: float = 1e-4
     weight_decay: float = 1e-2
+    label_smoothing: float = 0.0
+    embed_noise_std: float = 0.0   # Gaussian noise on valid speech tokens (train only)
+    token_mask_prob: float = 0.0   # Fraction of utterance tokens zeroed (train only)
+    lr_warmup_epochs: int = 0      # Linear warmup epochs before cosine decay (0 = no warmup)
     num_workers: int = 4
     seed: int = 42
     patience: int = 8
     use_amp: bool = True
 
+    # model (audio encoder params)
     d_model: int = 256
     num_layers: int = 6
     n_heads: int = 8
     dropout: float = 0.1
 
+    # cross-attn fusion
     crossattn_layers: int = 2
     crossattn_dropout: float = 0.1
 
+    # MLP params (used when model_type=mlp)
     mlp_hidden: int = 512
     mlp_layers: int = 2
 
+    # indexing/cache
     index_cache: str = ""
     gather_test_preds: bool = True
     cache_items: int = 128
     mmap_load: bool = True
 
+    # on-disk speaker cache (merged sequence per base_id)
     cache_root: str = ""
-    cache_mode: str = "speaker"
-    cache_dtype: str = "float16"
+    cache_mode: str = "speaker"  # speaker | none
+    cache_dtype: str = "float16"  # float16 | float32
     prebuild_cache: bool = False
 
+    # Text encoder (HuggingFace Transformers)
     text_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    context_cache: str = ""
+    context_cache: str = ""  # if empty, <out_dir>/context_hf_cache.pkl
     prebuild_text: bool = False
     text_dim_fallback: int = 384
     text_batch_size: int = 256
@@ -184,17 +241,44 @@ class HyperParams:
     text_fp16: bool = False
     text_use_gpu_parallel: bool = True
 
+    # output predictions
     test_threshold: float = 0.5
 
+    # attention dump
     dump_attn: bool = False
     attn_out: str = ""
     attn_max_batches: int = 50
-    attn_mode: str = "mean_query"
+    attn_mode: str = "mean_query"  # mean_query | last_query
 
+    # resume / finetune
     resume_from: Optional[str] = None
+    finetune_from: Optional[str] = None  # load weights only; epoch/optimizer reset to 1
 
 
+# -----------------------------
+# Robust embedding index
+# -----------------------------
 _CHUNK_RE = re.compile(r"(?P<base>.+?)(?P<tag>(?:__ch|_ch|__chunk|_chunk))(?P<idx>\d+)$", re.IGNORECASE)
+
+
+def _embed_key_for_path(wav_path_str: str, embed_index: Dict[str, Any]) -> str:
+    """
+    Resolve the embed_index key for a wav path.
+    The extraction script names chunks two ways:
+      - Seamless-style filenames: plain stem  (e.g. v00_s0030_i00000132_p0045)
+      - Everything else:          stem + sha1 hash of resolved path (e.g. speaker1_track_0014420d05)
+    Try the uid form first; fall back to plain stem for backwards compat.
+    """
+    import hashlib
+    p = Path(wav_path_str)
+    plain = p.stem.lower()
+    try:
+        resolved = str(p.resolve())
+    except Exception:
+        resolved = str(p)
+    h = hashlib.sha1(resolved.encode()).hexdigest()[:10]
+    uid = f"{plain}_{h}"
+    return uid if uid in embed_index else plain
 
 
 def _parse_base_and_idx(path: Path) -> Optional[Tuple[str, int]]:
@@ -229,6 +313,9 @@ def build_embed_index(embed_root: Path) -> Dict[str, List[str]]:
     return out
 
 
+# -----------------------------
+# Cache helpers + safe npy load
+# -----------------------------
 def _dtype_from_str(s: str) -> np.dtype:
     s = (s or "").lower().strip()
     if s in ("float16", "fp16", "half"):
@@ -283,6 +370,9 @@ def _np_load_safe(path: str, mmap_mode: Optional[str]) -> np.ndarray:
     return np.load(path, allow_pickle=False)
 
 
+# -----------------------------
+# Text embeddings (HF Transformers, DDP-parallel)
+# -----------------------------
 def _hash_embedding(text: str, dim: int = 384) -> np.ndarray:
     text = (text or "").strip().lower()
     h = hashlib.sha256(text.encode("utf-8")).digest()
@@ -309,7 +399,7 @@ def _encode_texts_hf(
     max_len: int,
     use_fp16: bool,
 ) -> np.ndarray:
-    from transformers import AutoTokenizer, AutoModel
+    from transformers import AutoTokenizer, AutoModel  # type: ignore
 
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModel.from_pretrained(model_name)
@@ -497,7 +587,7 @@ def build_relationship_text_embed_map_ddp(
 ) -> Dict[str, np.ndarray]:
     if is_main():
         rel_texts: List[str] = []
-        needed = {speaker_a_role_col, speaker_b_role_col, rel_detail_col}
+        needed = {rel_detail_col}  # speaker role cols are optional; absent cols fall back to ""
         for csv_path in csv_paths:
             if not csv_path.exists():
                 continue
@@ -545,6 +635,9 @@ def build_relationship_text_embed_map_ddp(
     )
 
 
+# -----------------------------
+# Dataset
+# -----------------------------
 class LRUCache:
     def __init__(self, max_items: int = 1024):
         self.max_items = max_items
@@ -641,9 +734,7 @@ class DyadicNaturalnessDataset(Dataset):
                 hp.label_col,
                 hp.context_col,
                 hp.rel_detail_col,
-                hp.speaker_a_role_col,
-                hp.speaker_b_role_col,
-            }
+            }  # speaker role cols are optional; absent cols fall back to ""
             missing = [c for c in needed if c not in (reader.fieldnames or [])]
             if missing:
                 raise ValueError(f"CSV missing required columns: {missing}")
@@ -651,8 +742,10 @@ class DyadicNaturalnessDataset(Dataset):
             for i, r in enumerate(reader):
                 p1_raw = str(r[hp.p1_path_col])
                 p2_raw = str(r[hp.p2_path_col])
-                a = Path(p1_raw).stem.lower()
-                b = Path(p2_raw).stem.lower()
+                a = _embed_key_for_path(p1_raw, self.embed_index)
+                b = _embed_key_for_path(p2_raw, self.embed_index)
+                a_display = Path(p1_raw).stem.lower()
+                b_display = Path(p2_raw).stem.lower()
                 lab = int(float(r[hp.label_col]))
 
                 for c in self.cat_cols:
@@ -670,8 +763,12 @@ class DyadicNaturalnessDataset(Dataset):
                     "row_idx_in_csv": i,
                     "p1_path": p1_raw,
                     "p2_path": p2_raw,
-                    "p1_base": a,
-                    "p2_base": b,
+                    "p1_base": a_display,
+                    "p2_base": b_display,
+                    "rel_detail": rd,
+                    "high_level_context": ctx,
+                    "speaker_a_role": ra,
+                    "speaker_b_role": rb,
                 }
                 raw_rows.append((a, b, lab, cat_ids, ctx, rel_txt, meta))
 
@@ -927,11 +1024,13 @@ class DyadicNaturalnessDataset(Dataset):
         seq = self._interleave_with_pad(seq_a, seq_b)
         T = int(seq.shape[0])
 
+        # Cats
         if not self.hp.use_cats:
             cat_ids_use = np.zeros((len(self.cat_cols),), dtype=np.int64)
         else:
             cat_ids_use = cat_ids.astype(np.int64, copy=False)
 
+        # Context
         if not self.hp.use_context:
             ctx_emb = np.zeros((self.hp.text_dim_fallback,), dtype=np.float32)
         else:
@@ -941,6 +1040,7 @@ class DyadicNaturalnessDataset(Dataset):
             else:
                 ctx_emb = ctx_emb.astype(np.float32, copy=False)
 
+        # Rel-text
         if self.hp.use_rel_text:
             rel_emb = self.rel_embed_map.get(rel_txt)
             if rel_emb is None:
@@ -978,6 +1078,9 @@ def collate_dyadic_batch(batch):
     return x_pad, lengths, cat_t, ctx_t, rel_t, ys, list(metas)
 
 
+# -----------------------------
+# Model blocks
+# -----------------------------
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -1013,6 +1116,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        # x: [B,H,T,Hd]
         cos = self.cos_cached[:seq_len][None, None, :, :]
         sin = self.sin_cached[:seq_len][None, None, :, :]
         x1 = x[..., ::2]
@@ -1050,14 +1154,14 @@ class MultiHeadAttentionRoPE(nn.Module):
         B, T, D = x.shape
         H, Hd = self.n_heads, self.head_dim
 
-        q = self.q_proj(x).view(B, T, H, Hd).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, H, Hd).transpose(1, 2)  # [B,H,T,Hd]
         k = self.k_proj(x).view(B, T, H, Hd).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, Hd).transpose(1, 2)
 
         q = self.rope(q, T)
         k = self.rope(k, T)
 
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(Hd)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(Hd)  # [B,H,T,T]
 
         if key_padding_mask is not None:
             scores = scores.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
@@ -1066,9 +1170,9 @@ class MultiHeadAttentionRoPE(nn.Module):
             cm = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
             scores = scores.masked_fill(cm[None, None, :, :], float("-inf"))
 
-        attn = F.softmax(scores, dim=-1)
+        attn = F.softmax(scores, dim=-1)  # [B,H,T,T]
         attn_drop = self.drop(attn)
-        out = attn_drop @ v
+        out = attn_drop @ v  # [B,H,T,Hd]
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         out = self.o_proj(out)
 
@@ -1100,6 +1204,10 @@ class LLaMAEncoderBlock(nn.Module):
 
 
 class NaturalnessTransformer(nn.Module):
+    """
+    LLaMA-ish audio encoder: input proj + conv + RoPE attention + SwiGLU.
+    Provides forward_tokens + encode_pooled.
+    """
 
     def __init__(
         self,
@@ -1130,6 +1238,11 @@ class NaturalnessTransformer(nn.Module):
         lengths: torch.Tensor,
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+        """
+        returns:
+          tokens: [B,T,D]
+          attn_list: list of [B,H,T,T] per layer if return_attn else None
+        """
         B, T, _ = x.shape
         h = self.input_proj(x)
         h = h + self.conv(h.transpose(1, 2)).transpose(1, 2)
@@ -1170,6 +1283,11 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class BaseTransformerAudioEncoder(nn.Module):
+    """
+    Base Transformer encoder: in_proj + sinusoidal PE + nn.TransformerEncoder.
+    Provides forward_tokens + encode_pooled.
+    """
+
     def __init__(self, d_in: int, d_model: int, num_layers: int, n_heads: int, dropout: float, max_len: int):
         super().__init__()
         self.in_proj = nn.Linear(d_in, d_model)
@@ -1229,20 +1347,28 @@ class CatCtxRelEncoder(nn.Module):
         cat = self.cat_proj(torch.cat(embs, dim=-1))
         ctx = self.ctx_proj(ctx_x)
         rel = self.rel_proj(rel_x)
-        return torch.cat([cat, ctx, rel], dim=-1)
+        return torch.cat([cat, ctx, rel], dim=-1)  # [B, 3*out_dim]
 
 
 def masked_mean_pool(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     B, T, D = x.shape
     rng = torch.arange(T, device=x.device)[None, :]
-    mask = (rng < lengths[:, None]).to(x.dtype)
-    mask3 = mask.unsqueeze(-1)
+    mask = (rng < lengths[:, None]).to(x.dtype)  # [B,T]
+    mask3 = mask.unsqueeze(-1)  # [B,T,1]
     summed = (x * mask3).sum(dim=1)
     denom = lengths.clamp(min=1).to(x.dtype).unsqueeze(-1)
     return summed / denom
 
 
+# -----------------------------
+# Fusion models
+# -----------------------------
 class NaturalnessFusionLLaMAModel(nn.Module):
+    """
+    LLaMA-ish audio encoder + concat aux -> head
+    Optional attention-return in forward() for test-time dumps.
+    """
+
     def __init__(
         self,
         d_in_audio: int,
@@ -1292,18 +1418,22 @@ class NaturalnessFusionLLaMAModel(nn.Module):
         kpm: [B,T] True=pad
         returns [B,T] attention over source positions after reducing heads and query positions.
         """
+        # mean over heads -> [B,T,T]
         a = attn_bhts.mean(dim=1)
         if mode == "last_query":
+            # use last *valid* query position per example
             B, T, _ = a.shape
             lengths = (~kpm).sum(dim=1).clamp_min(1)
-            idx = (lengths - 1).view(B, 1, 1).expand(B, 1, T)
-            aq = a.gather(1, idx).squeeze(1)
+            idx = (lengths - 1).view(B, 1, 1).expand(B, 1, T)  # [B,1,T]
+            aq = a.gather(1, idx).squeeze(1)  # [B,T]
         else:
-            valid_q = (~kpm).float()
-            denom = valid_q.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
-            aq = (a * valid_q[:, :, None]).sum(dim=1) / denom
+            # mean over all query positions (mask queries that are pad)
+            valid_q = (~kpm).float()  # [B,T]
+            denom = valid_q.sum(dim=1).clamp_min(1.0).unsqueeze(-1)  # [B,1]
+            aq = (a * valid_q[:, :, None]).sum(dim=1) / denom  # [B,T]
 
-        valid_src = (~kpm).float()
+        # mask + renormalize over valid source positions
+        valid_src = (~kpm).float()  # [B,T]
         aq = aq * valid_src
         denom2 = aq.sum(dim=1, keepdim=True).clamp_min(1e-9)
         aq = aq / denom2
@@ -1313,27 +1443,30 @@ class NaturalnessFusionLLaMAModel(nn.Module):
         if not return_attn:
             pooled_audio = self.audio.encode_pooled(x_audio, len_audio)
             if self.use_aux:
-                aux = self.aux(cat_x, ctx_x, rel_x)
+                aux = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
                 z = torch.cat([pooled_audio, aux], dim=-1)
             else:
                 z = pooled_audio
             return self.head(z).squeeze(-1)
 
+        # return attention summaries for llama
         tokens, attn_list = self.audio.forward_tokens(x_audio, len_audio, return_attn=True)
         assert attn_list is not None
         kpm = _kpm_from_lengths(len_audio, tokens.shape[1])
 
+        # pooled tokens
         valid = (~kpm).float().unsqueeze(-1)
         denom = valid.sum(dim=1).clamp_min(1.0)
         pooled_audio = (tokens * valid).sum(dim=1) / denom
 
         if self.use_aux:
-            aux = self.aux(cat_x, ctx_x, rel_x)
+            aux = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
             z = torch.cat([pooled_audio, aux], dim=-1)
         else:
             z = pooled_audio
         logits = self.head(z).squeeze(-1)
 
+        # reduce each layer attn to [B,T]
         attn_reduced: List[torch.Tensor] = []
         for a in attn_list:
             attn_reduced.append(self._reduce_self_attn(a, kpm, mode=self.attn_mode))
@@ -1341,6 +1474,10 @@ class NaturalnessFusionLLaMAModel(nn.Module):
 
 
 class BaseFusionTransformerModel(nn.Module):
+    """
+    Base transformer encoder + concat aux -> head (no attn dumping in this script)
+    """
+
     def __init__(
         self,
         d_in_audio: int,
@@ -1383,7 +1520,7 @@ class BaseFusionTransformerModel(nn.Module):
     def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x):
         pooled_audio = self.audio.encode_pooled(x_audio, len_audio)
         if self.use_aux:
-            aux = self.aux(cat_x, ctx_x, rel_x)
+            aux = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
             z = torch.cat([pooled_audio, aux], dim=-1)
         else:
             z = pooled_audio
@@ -1427,7 +1564,7 @@ class NaturalnessFusionMLPModel(nn.Module):
     def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x):
         pooled_audio = masked_mean_pool(x_audio, len_audio)
         if self.use_aux:
-            aux = self.aux(cat_x, ctx_x, rel_x)
+            aux = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
             z = torch.cat([pooled_audio, aux], dim=-1)
         else:
             z = pooled_audio
@@ -1461,7 +1598,7 @@ class NaturalnessFusionLogRegModel(nn.Module):
     def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x):
         pooled_audio = masked_mean_pool(x_audio, len_audio)
         if self.use_aux:
-            aux = self.aux(cat_x, ctx_x, rel_x)
+            aux = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
             z = torch.cat([pooled_audio, aux], dim=-1)
         else:
             z = pooled_audio
@@ -1469,7 +1606,15 @@ class NaturalnessFusionLogRegModel(nn.Module):
         return self.linear(z).squeeze(-1)
 
 
+# -----------------------------
+# Cross-attention fusion (dumpable)
+# -----------------------------
 class CrossAttnFusion(nn.Module):
+    """
+    One AUX token attends over AUDIO tokens (multi-layer).
+    Query = aux token, Key/Value = audio tokens.
+    """
+
     def __init__(self, d_model: int, n_heads: int, num_layers: int, dropout: float):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -1504,11 +1649,12 @@ class CrossAttnFusion(nn.Module):
                 qn, kvn, kvn,
                 key_padding_mask=kpm,
                 need_weights=return_weights,
-                average_attn_weights=False,
+                average_attn_weights=False,  # keep per-head weights
             )
             q = q + blk["drop"](attn_out)
             q = q + blk["ffn"](q)
             if return_weights:
+                # attn_w: [B, H, tgt_len(=1), src_len(=T)]
                 w_list.append(attn_w.detach())
         if return_weights:
             return q, w_list
@@ -1516,6 +1662,10 @@ class CrossAttnFusion(nn.Module):
 
 
 class NaturalnessCrossAttnModel(nn.Module):
+    """
+    LLaMA-ish audio token encoder + aux token cross-attends to audio.
+    """
+
     def __init__(
         self,
         d_in_audio: int,
@@ -1568,19 +1718,25 @@ class NaturalnessCrossAttnModel(nn.Module):
 
     @staticmethod
     def _reduce_cross_attn(attn_bh1t: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
-        a = attn_bh1t.mean(dim=1).squeeze(1)
+        """
+        attn_bh1t: [B,H,1,T]
+        returns: [B,T] mean over heads + mask + renorm
+        """
+        a = attn_bh1t.mean(dim=1).squeeze(1)  # [B,T]
         valid = (~kpm).float()
         a = a * valid
         denom = a.sum(dim=1, keepdim=True).clamp_min(1e-9)
         return a / denom
 
     def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x, return_attn: bool = False):
-        tokens, _ = self.audio_encoder.forward_tokens(x_audio, len_audio, return_attn=False)
+        # audio tokens
+        tokens, _ = self.audio_encoder.forward_tokens(x_audio, len_audio, return_attn=False)  # [B,T,D]
         kpm = _kpm_from_lengths(len_audio, tokens.shape[1])
 
+        # aux token
         if self.use_aux:
-            aux_feat = self.aux(cat_x, ctx_x, rel_x)
-            aux_tok = self.aux_to_tok(aux_feat).unsqueeze(1)
+            aux_feat = self.aux(cat_x, ctx_x, rel_x)  # type: ignore[union-attr]
+            aux_tok = self.aux_to_tok(aux_feat).unsqueeze(1)  # [B,1,D]
         else:
             valid = (~kpm).float().unsqueeze(-1)
             denom = valid.sum(dim=1).clamp_min(1.0)
@@ -1594,13 +1750,16 @@ class NaturalnessCrossAttnModel(nn.Module):
         fused, w_list = self.xattn(aux_tok, tokens, kpm, return_weights=True)
         logits = self.head(fused.squeeze(1)).squeeze(-1)
 
+        # reduce each layer weights to [B,T]
         attn_reduced: List[torch.Tensor] = []
         for w in w_list:
             attn_reduced.append(self._reduce_cross_attn(w, kpm))
         return logits, attn_reduced, kpm.detach(), len_audio.detach()
 
 
-
+# -----------------------------
+# Train/Eval + prediction saving
+# -----------------------------
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -1617,7 +1776,7 @@ def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor, threshold: 
 
 
 @torch.no_grad()
-def ddp_eval(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device, use_amp: bool, threshold: float):
+def ddp_eval(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device, use_amp: bool, threshold: float, embed_noise_std: float = 0.0):
     model.eval()
     loss_sum = torch.tensor(0.0, device=device)
     correct_sum = torch.tensor(0.0, device=device)
@@ -1630,6 +1789,11 @@ def ddp_eval(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
         ctx_x = ctx_x.to(device, non_blocking=True)
         rel_x = rel_x.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+
+        if embed_noise_std > 0.0:
+            _pos = torch.arange(x.shape[1], device=device).unsqueeze(0)
+            _valid = (_pos < lengths.unsqueeze(1)).float().unsqueeze(-1)
+            x = x + embed_noise_std * torch.randn_like(x) * _valid
 
         with autocast(enabled=use_amp):
             logits = model(x, lengths, cat_x, ctx_x, rel_x)
@@ -1661,7 +1825,14 @@ def ddp_test_collect_with_meta_and_attn(
     attn_max_batches: int,
     attn_out_dir: Path,
     attn_mode: str,
+    embed_noise_std: float = 0.0,
 ):
+    """
+    Collect y_true/y_prob + metas on all ranks (for later gather),
+    plus (rank0-only) attention dumps for supported models (crossattn + llama).
+
+    Returns (y_true_np, y_prob_np, metas, attn_payload_rank0_or_none)
+    """
     model.eval()
     y_true_list, y_prob_list = [], []
     meta_list: List[Dict[str, Any]] = []
@@ -1670,13 +1841,14 @@ def ddp_test_collect_with_meta_and_attn(
     attn_batches: List[Dict[str, Any]] = []
     dumped_batches = 0
 
-    supports_attn = hasattr(model, "module") and hasattr(model.module, "forward")
+    supports_attn = hasattr(model, "module") and hasattr(model.module, "forward")  # DDP wrapper check
     raw_model = model.module if hasattr(model, "module") else model
 
     def _try_forward_with_attn(x, lengths, cat_x, ctx_x, rel_x):
+        # Expect forward(..., return_attn=True) -> (logits, attn_list, kpm, lengths)
         if hasattr(raw_model, "forward"):
             try:
-                return raw_model.forward(x, lengths, cat_x, ctx_x, rel_x, return_attn=True)
+                return raw_model.forward(x, lengths, cat_x, ctx_x, rel_x, return_attn=True)  # type: ignore
             except TypeError:
                 return None
         return None
@@ -1688,6 +1860,11 @@ def ddp_test_collect_with_meta_and_attn(
         ctx_x = ctx_x.to(device, non_blocking=True)
         rel_x = rel_x.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+
+        if embed_noise_std > 0.0:
+            _pos = torch.arange(x.shape[1], device=device).unsqueeze(0)
+            _valid = (_pos < lengths.unsqueeze(1)).float().unsqueeze(-1)
+            x = x + embed_noise_std * torch.randn_like(x) * _valid
 
         with autocast(enabled=use_amp):
             attn_pack = None
@@ -1706,8 +1883,10 @@ def ddp_test_collect_with_meta_and_attn(
         y_prob_list.append(probs.detach().cpu())
         meta_list.extend(metas)
 
+        # rank0 attention dump
         if do_attn and attn_pack is not None and dumped_batches < attn_max_batches:
             attn_list, kpm, lens_out = attn_pack
+            # attn_list: list of [B,T] (already reduced in model forward)
             attn_cpu = [a.detach().float().cpu().numpy() for a in attn_list]
             kpm_cpu = kpm.detach().cpu().numpy()
             lens_cpu = lens_out.detach().cpu().numpy()
@@ -1715,10 +1894,10 @@ def ddp_test_collect_with_meta_and_attn(
             attn_batches.append(
                 {
                     "batch_idx": batch_idx,
-                    "metas": metas,
+                    "metas": metas,  # list of dicts
                     "lengths": lens_cpu,
                     "kpm": kpm_cpu,
-                    "attn_reduced": attn_cpu,
+                    "attn_reduced": attn_cpu,  # list length = n_layers; each [B,T]
                 }
             )
             dumped_batches += 1
@@ -1763,8 +1942,12 @@ def _write_test_outputs(out_dir: Path, y_true: np.ndarray, y_prob: np.ndarray, m
                 "p2_base",
                 "p1_path",
                 "p2_path",
-                "label",
-                "y_prob",
+                "rel_detail",
+                "high_level_context",
+                "speaker_a_role",
+                "speaker_b_role",
+                "base_naturalness",
+                "naturalness_score",
                 "y_pred",
                 "correct",
             ],
@@ -1780,8 +1963,12 @@ def _write_test_outputs(out_dir: Path, y_true: np.ndarray, y_prob: np.ndarray, m
                     "p2_base": m.get("p2_base", ""),
                     "p1_path": m.get("p1_path", ""),
                     "p2_path": m.get("p2_path", ""),
-                    "label": int(y_true[i]),
-                    "y_prob": float(y_prob[i]),
+                    "rel_detail": m.get("rel_detail", ""),
+                    "high_level_context": m.get("high_level_context", ""),
+                    "speaker_a_role": m.get("speaker_a_role", ""),
+                    "speaker_b_role": m.get("speaker_b_role", ""),
+                    "base_naturalness": int(y_true[i]),
+                    "naturalness_score": float(y_prob[i]),
                     "y_pred": int(y_pred[i]),
                     "correct": int(correct[i]),
                 }
@@ -1797,8 +1984,12 @@ def _write_test_outputs(out_dir: Path, y_true: np.ndarray, y_prob: np.ndarray, m
                 "p2_base",
                 "p1_path",
                 "p2_path",
-                "label",
-                "y_prob",
+                "rel_detail",
+                "high_level_context",
+                "speaker_a_role",
+                "speaker_b_role",
+                "base_naturalness",
+                "naturalness_score",
                 "y_pred",
             ],
         )
@@ -1815,8 +2006,12 @@ def _write_test_outputs(out_dir: Path, y_true: np.ndarray, y_prob: np.ndarray, m
                     "p2_base": m.get("p2_base", ""),
                     "p1_path": m.get("p1_path", ""),
                     "p2_path": m.get("p2_path", ""),
-                    "label": int(y_true[i]),
-                    "y_prob": float(y_prob[i]),
+                    "rel_detail": m.get("rel_detail", ""),
+                    "high_level_context": m.get("high_level_context", ""),
+                    "speaker_a_role": m.get("speaker_a_role", ""),
+                    "speaker_b_role": m.get("speaker_b_role", ""),
+                    "base_naturalness": int(y_true[i]),
+                    "naturalness_score": float(y_prob[i]),
                     "y_pred": int(y_pred[i]),
                 }
             )
@@ -1831,6 +2026,12 @@ def _write_test_outputs(out_dir: Path, y_true: np.ndarray, y_prob: np.ndarray, m
         out["brier"] = float(brier_score_loss(y_true.astype(np.int64), y_prob.astype(np.float64)))
     except Exception:
         out["brier"] = None
+    try:
+        out["f1_macro"] = float(f1_score(y_true.astype(np.int64), y_pred.astype(np.int64), average="macro"))
+        out["f1_unnatural"] = float(f1_score(y_true.astype(np.int64), y_pred.astype(np.int64), pos_label=0, average="binary"))
+        out["f1_natural"] = float(f1_score(y_true.astype(np.int64), y_pred.astype(np.int64), pos_label=1, average="binary"))
+    except Exception:
+        out["f1_macro"] = out["f1_unnatural"] = out["f1_natural"] = None
 
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
@@ -1853,6 +2054,7 @@ def _attn_summary_from_batches(attn_batches: List[Dict[str, Any]]) -> Dict[str, 
     if not attn_batches:
         return {"note": "no attention batches"}
 
+    # infer num layers
     L = len(attn_batches[0]["attn_reduced"])
     ent_sums = np.zeros((L,), dtype=np.float64)
     top1_sums = np.zeros((L,), dtype=np.float64)
@@ -1860,12 +2062,13 @@ def _attn_summary_from_batches(attn_batches: List[Dict[str, Any]]) -> Dict[str, 
     n_sums = np.zeros((L,), dtype=np.float64)
 
     for b in attn_batches:
-        kpm = b["kpm"].astype(bool)
+        kpm = b["kpm"].astype(bool)  # [B,T]
         valid = (~kpm).astype(np.float32)
         for li in range(L):
-            a = b["attn_reduced"][li].astype(np.float64)
+            a = b["attn_reduced"][li].astype(np.float64)  # [B,T], already masked+renorm
+            # compute entropy over valid positions
             ent = _entropy(a)
-
+            # top-k mass
             top1 = np.max(a, axis=-1)
             top5 = np.sort(a, axis=-1)[:, -5:].sum(axis=-1) if a.shape[1] >= 5 else np.sort(a, axis=-1).sum(axis=-1)
             ent_sums[li] += ent.sum()
@@ -1887,7 +2090,9 @@ def _attn_summary_from_batches(attn_batches: List[Dict[str, Any]]) -> Dict[str, 
     return out
 
 
-
+# -----------------------------
+# CLI
+# -----------------------------
 def parse_args() -> HyperParams:
     p = argparse.ArgumentParser()
 
@@ -1906,6 +2111,7 @@ def parse_args() -> HyperParams:
         help="Methods: base_transformer | llama | crossattn | mlp | logreg. Alias: transformer -> llama.",
     )
 
+    # cols
     p.add_argument("--p1-path-col", type=str, default=HyperParams.p1_path_col)
     p.add_argument("--p2-path-col", type=str, default=HyperParams.p2_path_col)
     p.add_argument("--label-col", type=str, default=HyperParams.label_col)
@@ -1915,39 +2121,57 @@ def parse_args() -> HyperParams:
     p.add_argument("--speaker-a-role-col", type=str, default=HyperParams.speaker_a_role_col)
     p.add_argument("--speaker-b-role-col", type=str, default=HyperParams.speaker_b_role_col)
 
+    # feature toggles
     p.add_argument("--speech-only", action="store_true", help="Disable ALL non-speech features (cats + context + rel-text).")
     p.add_argument("--no-cats", action="store_true", help="Disable categorical features (speaker roles + rel_detail ids).")
     p.add_argument("--no-context", action="store_true", help="Disable high_level_context text embeddings.")
     p.add_argument("--no-rel-text", action="store_true", help="Disable relationship text embeddings.")
 
+    # relationship text embedding
     p.add_argument("--rel-text-template", type=str, default=HyperParams.rel_text_template)
     p.add_argument("--rel-text-cache", type=str, default="")
 
+    # window/splits
     p.add_argument("--max-seq-len", type=int, default=HyperParams.max_seq_len)
     p.add_argument("--window-strategy", type=str, default=HyperParams.window_strategy, choices=["head", "random"])
     p.add_argument("--val-split", type=float, default=HyperParams.val_split, help="If no --val-csv, carve this fraction from train for validation. Use 0.0 for no val.")
     p.add_argument("--patience", type=int, default=HyperParams.patience, help="Early stopping patience (only used if validation exists).")
 
+    # training
     p.add_argument("--batch-size", type=int, default=HyperParams.batch_size)
     p.add_argument("--num-epochs", type=int, default=HyperParams.num_epochs)
     p.add_argument("--lr", type=float, default=HyperParams.lr)
     p.add_argument("--weight-decay", type=float, default=HyperParams.weight_decay)
+    p.add_argument("--label-smoothing", type=float, default=HyperParams.label_smoothing,
+                   help="Label smoothing for BCEWithLogitsLoss (0=off, 0.1=typical).")
+    p.add_argument("--embed-noise-std", type=float, default=HyperParams.embed_noise_std,
+                   help="Std of Gaussian noise added to valid speech tokens during training only.")
+    p.add_argument("--token-mask-prob", type=float, default=HyperParams.token_mask_prob,
+                   help="Probability of zeroing entire utterance tokens during training only.")
+    p.add_argument("--lr-warmup-epochs", type=int, default=HyperParams.lr_warmup_epochs,
+                   help="Linear LR warmup epochs before cosine decay (0 = cosine from epoch 1).")
     p.add_argument("--num-workers", type=int, default=HyperParams.num_workers)
     p.add_argument("--seed", type=int, default=HyperParams.seed)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--resume-from", type=str, default=None)
+    p.add_argument("--finetune-from", type=str, default=None,
+                   help="Load model weights only from checkpoint; epoch/optimizer reset (no resume).")
 
+    # transformer model params
     p.add_argument("--d-model", type=int, default=HyperParams.d_model)
     p.add_argument("--num-layers", type=int, default=HyperParams.num_layers)
     p.add_argument("--n-heads", type=int, default=HyperParams.n_heads)
     p.add_argument("--dropout", type=float, default=HyperParams.dropout)
 
+    # cross-attn params
     p.add_argument("--crossattn-layers", type=int, default=HyperParams.crossattn_layers)
     p.add_argument("--crossattn-dropout", type=float, default=HyperParams.crossattn_dropout)
 
+    # MLP model params
     p.add_argument("--mlp-hidden", type=int, default=HyperParams.mlp_hidden)
     p.add_argument("--mlp-layers", type=int, default=HyperParams.mlp_layers)
 
+    # indexing/cache
     p.add_argument("--index-cache", type=str, default="")
     p.add_argument("--no-gather-test-preds", action="store_true")
     p.add_argument("--cache-items", type=int, default=HyperParams.cache_items)
@@ -1958,6 +2182,7 @@ def parse_args() -> HyperParams:
     p.add_argument("--cache-dtype", type=str, default="float16", choices=["float16", "float32"])
     p.add_argument("--prebuild-cache", action="store_true")
 
+    # text encoder (HF)
     p.add_argument("--text-model", type=str, default=HyperParams.text_model)
     p.add_argument("--context-cache", type=str, default="")
     p.add_argument("--prebuild-text", action="store_true")
@@ -1966,9 +2191,11 @@ def parse_args() -> HyperParams:
     p.add_argument("--text-fp16", action="store_true")
     p.add_argument("--no-text-gpu-parallel", action="store_true")
 
+    # test output
     p.add_argument("--test-threshold", type=float, default=0.5, help="Threshold on sigmoid(logit) to compute y_pred.")
     p.add_argument("--no-write-test-preds", action="store_true", help="Disable writing test_predictions/misclassified/metrics files.")
 
+    # attention dump
     p.add_argument("--dump-attn", action="store_true", help="Dump reduced attention during test (rank0). Only for llama/crossattn.")
     p.add_argument("--attn-out", type=str, default="", help="Directory to write attention dumps (default: <out_dir>/attn).")
     p.add_argument("--attn-max-batches", type=int, default=50, help="Limit number of test batches to dump attention for.")
@@ -2003,6 +2230,10 @@ def parse_args() -> HyperParams:
         num_epochs=a.num_epochs,
         lr=a.lr,
         weight_decay=a.weight_decay,
+        label_smoothing=float(a.label_smoothing),
+        embed_noise_std=float(a.embed_noise_std),
+        token_mask_prob=float(a.token_mask_prob),
+        lr_warmup_epochs=int(a.lr_warmup_epochs),
         num_workers=a.num_workers,
         seed=a.seed,
         patience=a.patience,
@@ -2036,21 +2267,26 @@ def parse_args() -> HyperParams:
         attn_max_batches=int(a.attn_max_batches),
         attn_mode=str(a.attn_mode),
         resume_from=a.resume_from,
+        finetune_from=a.finetune_from,
     )
-    hp._no_write_test_preds = bool(a.no_write_test_preds)
+    hp._no_write_test_preds = bool(a.no_write_test_preds)  # type: ignore[attr-defined]
 
+    # speech-only override
     if hp.speech_only:
         hp.use_cats = False
         hp.use_context = False
         hp.use_rel_text = False
 
+    # alias
     if (hp.model_type or "").lower().strip() == "transformer":
         hp.model_type = "llama"
 
     return hp
 
 
-
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     distributed, rank, local_rank = setup_ddp_from_env()
     hp = parse_args()
@@ -2086,6 +2322,7 @@ def main():
     if not embed_root.exists():
         raise FileNotFoundError(f"embed_root not found: {embed_root}")
 
+    # Build/load audio index cache
     index_cache = Path(hp.index_cache) if hp.index_cache else (out_dir / "embed_index.pkl")
     if is_main():
         if index_cache.exists():
@@ -2107,6 +2344,7 @@ def main():
             embed_index = pickle.load(f)
     ddp_barrier()
 
+    # Text cache paths
     context_cache = Path(hp.context_cache) if hp.context_cache else (out_dir / "context_hf_cache.pkl")
     rel_cache = Path(hp.rel_text_cache) if hp.rel_text_cache else (out_dir / "relationship_hf_cache.pkl")
 
@@ -2154,6 +2392,7 @@ def main():
 
     ddp_barrier()
 
+    # Load text maps
     if not hp.use_context:
         context_embed_map = {}
     else:
@@ -2178,6 +2417,7 @@ def main():
 
     ddp_barrier()
 
+    # Datasets
     train_dataset_full = DyadicNaturalnessDataset(
         csv_path=hp.train_csv,
         embed_index=embed_index,
@@ -2207,6 +2447,7 @@ def main():
             print("\n[ERROR] Test dataset is empty AFTER filtering.")
         raise ValueError("Test dataset is empty.")
 
+    # Optional explicit val dataset
     if hp.val_csv:
         val_dataset = DyadicNaturalnessDataset(
             csv_path=hp.val_csv,
@@ -2219,6 +2460,7 @@ def main():
     else:
         val_dataset = None
 
+    # Or carve val from train
     if (val_dataset is None) and (hp.val_split and hp.val_split > 0.0):
         N = len(train_dataset_full)
         val_n = max(1, int(N * hp.val_split))
@@ -2244,12 +2486,14 @@ def main():
             else:
                 print(f"[Split] train={len(train_set)} val={len(val_set)} (explicit val_csv)")
 
+    # Optional speaker cache prebuild (rank0)
     if hp.prebuild_cache and hp.cache_root and hp.cache_mode == "speaker":
         if is_main():
             train_dataset_full.prebuild_speaker_cache_rank0()
         ddp_barrier()
 
-    x0, _, ctx0, rel0, _, _m0 = None, None, None, None, None, None
+    # Determine dims
+    x0, _, ctx0, rel0, _, _m0 = None, None, None, None, None, None  # silence type checkers
     x0, _, cat0, ctx0, rel0, _, _m0 = train_dataset_full[0]
     d_in_audio = int(x0.shape[-1])
     ctx_dim = int(ctx0.shape[-1])
@@ -2266,6 +2510,7 @@ def main():
         print(f"Detected: d_in_audio={d_in_audio} ctx_dim={ctx_dim} rel_dim={rel_dim} cat_cards={cat_cards} use_aux={use_aux}")
         print(f"Train usable={len(train_set)} | Test usable={len(test_dataset)}")
 
+    # Samplers/loaders
     train_sampler = DistributedSampler(train_set, shuffle=True, drop_last=False) if distributed else None
     val_sampler = DistributedSampler(val_set, shuffle=False, drop_last=False) if (distributed and val_set is not None) else None
     test_sampler = DistributedSampler(test_dataset, shuffle=False, drop_last=False) if distributed else None
@@ -2283,6 +2528,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=hp.batch_size, shuffle=False, sampler=val_sampler, **dl_common) if val_set is not None else None
     test_loader = DataLoader(test_dataset, batch_size=hp.batch_size, shuffle=False, sampler=test_sampler, **dl_common)
 
+    # Model selection
     mt = (hp.model_type or "llama").lower().strip()
     if mt == "transformer":
         mt = "llama"
@@ -2371,9 +2617,24 @@ def main():
             find_unused_parameters=False,
         )
 
-    criterion = nn.BCEWithLogitsLoss()
+    _ls = hp.label_smoothing
+    if _ls > 0.0:
+        # Soft targets: true→(1-ls), false→ls
+        def criterion(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            soft = targets * (1.0 - _ls) + (1.0 - targets) * _ls
+            return nn.functional.binary_cross_entropy_with_logits(logits, soft)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=hp.lr, weight_decay=hp.weight_decay)
     scaler = GradScaler(enabled=hp.use_amp)
+
+    # Cosine LR with optional linear warmup
+    def _lr_lambda(ep0: int) -> float:
+        if ep0 < hp.lr_warmup_epochs:
+            return float(ep0 + 1) / float(max(1, hp.lr_warmup_epochs))
+        progress = float(ep0 - hp.lr_warmup_epochs) / float(max(1, hp.num_epochs - hp.lr_warmup_epochs))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
     metrics_path = out_dir / "metrics.jsonl"
     best_model_path = out_dir / "best_model.pt"
@@ -2382,6 +2643,7 @@ def main():
     if is_main():
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resume
     start_epoch = 1
     best_score = -1.0
     epochs_no_improve = 0
@@ -2401,6 +2663,11 @@ def main():
             optimizer.load_state_dict(state["optimizer_state_dict"])
         if hp.use_amp and state.get("scaler_state_dict") is not None:
             scaler.load_state_dict(state["scaler_state_dict"])
+        if state.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+        else:
+            for _ in range(start_epoch - 1):
+                scheduler.step()
 
         start_epoch = int(state.get("epoch", 0)) + 1
         best_score = float(state.get("best_score", -1.0))
@@ -2408,6 +2675,18 @@ def main():
 
         if is_main():
             print(f"Resumed from {ck} -> start_epoch={start_epoch}, best_score={best_score:.4f}")
+
+    elif hp.finetune_from:
+        ck = Path(hp.finetune_from)
+        if not ck.exists():
+            raise FileNotFoundError(f"--finetune-from not found: {ck}")
+        maploc = {"cuda:%d" % 0: "cuda:%d" % local_rank} if torch.cuda.is_available() else "cpu"
+        state = torch.load(str(ck), map_location=maploc)
+        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model.load_state_dict(state["model_state_dict"])
+        # epoch/optimizer/scheduler intentionally not restored — fresh training run
+        if is_main():
+            print(f"Fine-tuning from {ck} (weights only, training starts from epoch 1)")
 
     ddp_barrier()
     if is_main():
@@ -2435,6 +2714,19 @@ def main():
             rel_x = rel_x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
+            # Valid-position mask: [B, T, 1] — True for real utterances
+            _pos = torch.arange(x.shape[1], device=device).unsqueeze(0)
+            _valid = (_pos < lengths.unsqueeze(1)).float().unsqueeze(-1)
+
+            # Gaussian noise on valid tokens (applied at train+test; set here for train)
+            if hp.embed_noise_std > 0.0:
+                x = x + hp.embed_noise_std * torch.randn_like(x) * _valid
+
+            # Token masking: zero random utterances during training only
+            if hp.token_mask_prob > 0.0:
+                _tmask = (torch.rand(x.shape[0], x.shape[1], 1, device=device) < hp.token_mask_prob) & (_valid.bool())
+                x = x * (~_tmask).float()
+
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=hp.use_amp):
@@ -2461,6 +2753,7 @@ def main():
             if is_main():
                 it.set_postfix(loss=f"{loss.item():.4f}")
 
+        # Global train stats
         t_loss = torch.tensor([loss_sum_local, total_local], device=device, dtype=torch.float32)
         t_corr = torch.tensor([correct_local, total_local], device=device, dtype=torch.float32)
         all_reduce_sum(t_loss)
@@ -2468,6 +2761,8 @@ def main():
 
         train_loss = (t_loss[0] / t_loss[1].clamp(min=1.0)).item()
         train_acc = (t_corr[0] / t_corr[1].clamp(min=1.0)).item()
+
+        scheduler.step()
 
         if has_val:
             val_loss, val_acc = ddp_eval(model, val_loader, criterion, device, hp.use_amp, threshold=hp.test_threshold)  # type: ignore[arg-type]
@@ -2482,6 +2777,7 @@ def main():
             else:
                 print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} train_acc={train_acc:.4f} | (no val)")
 
+            out_dir.mkdir(parents=True, exist_ok=True)  # re-ensure on NFS
             with metrics_path.open("a") as mf:
                 mf.write(
                     json.dumps(
@@ -2499,12 +2795,14 @@ def main():
 
             raw_model = model.module if isinstance(model, DDP) else model
 
+            ckpt_dir.mkdir(parents=True, exist_ok=True)  # re-ensure on NFS
             ckpt_path = ckpt_dir / f"epoch_{epoch}.pt"
             torch.save(
                 {
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict() if hp.use_amp else None,
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
                     "best_score": best_score,
                     "epochs_no_improve": epochs_no_improve,
@@ -2563,6 +2861,7 @@ def main():
 
     ddp_barrier()
 
+    # ---- TEST EVAL ----
     ck_to_use = best_model_path if best_model_path.exists() else last_model_path
     maploc = {"cuda:%d" % 0: "cuda:%d" % local_rank} if torch.cuda.is_available() else "cpu"
     state = torch.load(str(ck_to_use), map_location=maploc)
@@ -2573,6 +2872,7 @@ def main():
     if is_main():
         print(f"[TEST] ckpt={ck_to_use.name} loss={test_loss:.4f} acc={test_acc:.4f}")
 
+    # Gather per-datapoint preds + metas and write to disk (rank0)
     if hp.gather_test_preds:
         attn_dir = Path(hp.attn_out) if hp.attn_out else (out_dir / "attn")
 
@@ -2587,10 +2887,11 @@ def main():
             attn_mode=hp.attn_mode,
         )
 
+
         if ddp_is_available():
-            gathered_true: List[np.ndarray] = [None] * get_world_size()
-            gathered_prob: List[np.ndarray] = [None] * get_world_size()
-            gathered_meta: List[List[Dict[str, Any]]] = [None] * get_world_size()
+            gathered_true: List[np.ndarray] = [None] * get_world_size()  # type: ignore
+            gathered_prob: List[np.ndarray] = [None] * get_world_size()  # type: ignore
+            gathered_meta: List[List[Dict[str, Any]]] = [None] * get_world_size()  # type: ignore
             dist.all_gather_object(gathered_true, y_true_local)
             dist.all_gather_object(gathered_prob, y_prob_local)
             dist.all_gather_object(gathered_meta, metas_local)
@@ -2609,7 +2910,7 @@ def main():
         if is_main() and y_true.size > 0:
             y_pred = (y_prob >= hp.test_threshold).astype(np.int64)
             print("\n=== Classification report (test) ===")
-            print(classification_report(y_true, y_pred, target_names=["unnatural (0)", "natural (1)"], digits=4))
+            print(classification_report(y_true, y_pred, target_names=["unnatural (0)", "natural (1)"], labels=[0, 1], digits=4))
             print("=== Confusion matrix ===")
             print(confusion_matrix(y_true, y_pred))
             try:
@@ -2621,9 +2922,11 @@ def main():
             if not getattr(hp, "_no_write_test_preds", False):
                 _write_test_outputs(out_dir=out_dir, y_true=y_true, y_prob=y_prob, metas=metas, threshold=hp.test_threshold)
 
+            # If attention dumped on rank0, compute summary
             if hp.dump_attn and (mt in ("llama", "crossattn")):
                 attn_path = attn_dir / "attn_batches.pt"
                 if attn_path.exists():
+                    # payload = torch.load(str(attn_path), map_location="cpu")
                     payload = torch.load(str(attn_path), map_location="cpu", weights_only=False)
                     attn_batches = payload.get("batches", [])
                     summary = _attn_summary_from_batches(attn_batches)

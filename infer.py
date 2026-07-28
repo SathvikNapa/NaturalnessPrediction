@@ -227,7 +227,7 @@ class MultiHeadAttentionRoPE(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x, key_padding_mask, causal=False):
+    def forward(self, x, key_padding_mask, causal=False, return_attn=False):
         B, T, D = x.shape
         H, Hd = self.n_heads, self.head_dim
         q = self.q_proj(x).view(B, T, H, Hd).transpose(1, 2)
@@ -241,9 +241,10 @@ class MultiHeadAttentionRoPE(nn.Module):
         if causal:
             cm = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
             scores = scores.masked_fill(cm[None, None], float("-inf"))
-        attn = self.drop(F.softmax(scores, dim=-1))
-        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, D)
-        return self.o_proj(out)
+        attn = F.softmax(scores, dim=-1)
+        attn_drop = self.drop(attn)
+        out = (attn_drop @ v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.o_proj(out), (attn if return_attn else None)
 
 
 class LLaMAEncoderBlock(nn.Module):
@@ -255,11 +256,12 @@ class LLaMAEncoderBlock(nn.Module):
         self.mlp = SwiGLU(d_model)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, key_padding_mask, causal=False):
+    def forward(self, x, key_padding_mask, causal=False, return_attn=False):
         h = self.attn_norm(x)
-        x = x + self.drop(self.attn(h, key_padding_mask, causal=causal))
+        attn_out, attn = self.attn(h, key_padding_mask, causal=causal, return_attn=return_attn)
+        x = x + self.drop(attn_out)
         x = x + self.drop(self.mlp(self.ffn_norm(x)))
-        return x
+        return x, attn
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -325,19 +327,22 @@ class NaturalnessTransformer(nn.Module):
         )
         self.final_norm = RMSNorm(d_model)
 
-    def forward_tokens(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward_tokens(self, x: torch.Tensor, lengths: torch.Tensor, return_attn: bool = False):
         B, T, _ = x.shape
         h = self.input_proj(x)
         h = h + self.conv(h.transpose(1, 2)).transpose(1, 2)
         kpm = torch.arange(T, device=x.device)[None, :] >= lengths[:, None]
+        attn_list = []
         for layer in self.layers:
-            h = layer(h, key_padding_mask=kpm, causal=self.causal)
+            h, attn = layer(h, key_padding_mask=kpm, causal=self.causal, return_attn=return_attn)
+            if return_attn and attn is not None:
+                attn_list.append(attn)
         h = self.final_norm(h)
-        return h
+        return h, (attn_list if return_attn else None)
 
     def encode_pooled(self, x, lengths):
         B, T, _ = x.shape
-        h = self.forward_tokens(x, lengths)
+        h, _ = self.forward_tokens(x, lengths, return_attn=False)
         kpm = torch.arange(T, device=x.device)[None, :] >= lengths[:, None]
         valid = (~kpm).float().unsqueeze(-1)
         return (h * valid).sum(1) / lengths.clamp(min=1).unsqueeze(-1).to(h.dtype)
@@ -416,9 +421,11 @@ class NaturalnessFusionTransformerModel(nn.Module):
         cat_embed_dim=32,
         ctx_ln: bool = True,
         rel_ln: bool = True,
+        attn_mode: str = "mean_query",
     ):
         super().__init__()
         self.use_aux = bool(use_aux)
+        self.attn_mode = attn_mode
         self.audio = NaturalnessTransformer(
             d_in_audio, audio_d_model, num_layers, n_heads, dropout, max_len, False
         )
@@ -435,11 +442,47 @@ class NaturalnessFusionTransformerModel(nn.Module):
             nn.Linear(fusion_in, 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, 1),
         )
 
-    def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x):
-        p = self.audio.encode_pooled(x_audio, len_audio)
+    @staticmethod
+    def _reduce_self_attn(attn_bhts: torch.Tensor, kpm: torch.Tensor, mode: str) -> torch.Tensor:
+        """Reduce [B,H,T,T] attn to [B,T] for attention dumping."""
+        a = attn_bhts.mean(dim=1)
+        if mode == "last_query":
+            B, T, _ = a.shape
+            lengths = (~kpm).sum(dim=1).clamp_min(1)
+            idx = (lengths - 1).view(B, 1, 1).expand(B, 1, T)
+            aq = a.gather(1, idx).squeeze(1)
+        else:
+            valid_q = (~kpm).float()
+            denom = valid_q.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
+            aq = (a * valid_q[:, :, None]).sum(dim=1) / denom
+        valid_src = (~kpm).float()
+        aq = aq * valid_src
+        denom2 = aq.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        return aq / denom2
+
+    def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x, return_attn: bool = False):
+        if not return_attn:
+            p = self.audio.encode_pooled(x_audio, len_audio)
+            if self.use_aux:
+                p = torch.cat([p, self.aux(cat_x, ctx_x, rel_x)], -1)
+            return self.head(p).squeeze(-1)
+
+        tokens, attn_list = self.audio.forward_tokens(x_audio, len_audio, return_attn=True)
+        assert attn_list is not None
+        T = tokens.shape[1]
+        kpm = torch.arange(T, device=x_audio.device)[None, :] >= len_audio[:, None]
+        valid = (~kpm).float().unsqueeze(-1)
+        denom = valid.sum(dim=1).clamp_min(1.0)
+        pooled = (tokens * valid).sum(dim=1) / denom
         if self.use_aux:
-            p = torch.cat([p, self.aux(cat_x, ctx_x, rel_x)], -1)
-        return self.head(p).squeeze(-1)
+            pooled = torch.cat([pooled, self.aux(cat_x, ctx_x, rel_x)], -1)
+        logits = self.head(pooled).squeeze(-1)
+        attn_reduced = [self._reduce_self_attn(a, kpm, self.attn_mode) for a in attn_list]
+        return logits, attn_reduced, kpm.detach(), len_audio.detach()
+
+
+# Alias kept for any external code that imports by the old name.
+NaturalnessFusionLLaMAModel = NaturalnessFusionTransformerModel
 
 
 class BaseFusionTransformerModel(nn.Module):
@@ -582,14 +625,24 @@ class CrossAttnFusion(nn.Module):
             for _ in range(max(1, int(num_layers)))
         ])
 
-    def forward(self, aux_tok: torch.Tensor, audio_tokens: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
+    def forward(self, aux_tok: torch.Tensor, audio_tokens: torch.Tensor, kpm: torch.Tensor, return_weights: bool = False):
         q = aux_tok
+        w_list = []
         for blk in self.layers:
             qn = blk["norm_q"](q)
             kvn = blk["norm_kv"](audio_tokens)
-            attn_out, _ = blk["attn"](qn, kvn, kvn, key_padding_mask=kpm, need_weights=False)
+            attn_out, attn_w = blk["attn"](
+                qn, kvn, kvn,
+                key_padding_mask=kpm,
+                need_weights=return_weights,
+                average_attn_weights=False,
+            )
             q = q + blk["drop"](attn_out)
             q = q + blk["ffn"](q)
+            if return_weights and attn_w is not None:
+                w_list.append(attn_w.detach())
+        if return_weights:
+            return q, w_list
         return q
 
 
@@ -637,9 +690,18 @@ class NaturalnessCrossAttnModel(nn.Module):
             nn.Linear(d_model, 256), nn.GELU(), nn.Dropout(dropout), nn.Linear(256, 1),
         )
 
-    def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x):
-        T = x_audio.shape[1]
-        tokens = self.audio_encoder.forward_tokens(x_audio, len_audio)
+    @staticmethod
+    def _reduce_cross_attn(attn_bh1t: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
+        """Reduce [B,H,1,T] cross-attn weights to [B,T]."""
+        a = attn_bh1t.mean(dim=1).squeeze(1)
+        valid = (~kpm).float()
+        a = a * valid
+        denom = a.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        return a / denom
+
+    def forward(self, x_audio, len_audio, cat_x, ctx_x, rel_x, return_attn: bool = False):
+        tokens, _ = self.audio_encoder.forward_tokens(x_audio, len_audio, return_attn=False)
+        T = tokens.shape[1]
         kpm = torch.arange(T, device=x_audio.device)[None, :] >= len_audio[:, None]
         if self.use_aux:
             aux_feat = self.aux(cat_x, ctx_x, rel_x)
@@ -648,8 +710,15 @@ class NaturalnessCrossAttnModel(nn.Module):
             valid = (~kpm).float().unsqueeze(-1)
             pooled = (tokens * valid).sum(1) / len_audio.clamp(min=1).unsqueeze(-1).to(tokens.dtype)
             aux_tok = pooled.unsqueeze(1)
-        fused = self.xattn(aux_tok, tokens, kpm)
-        return self.head(fused.squeeze(1)).squeeze(-1)
+
+        if not return_attn:
+            fused = self.xattn(aux_tok, tokens, kpm, return_weights=False)
+            return self.head(fused.squeeze(1)).squeeze(-1)
+
+        fused, w_list = self.xattn(aux_tok, tokens, kpm, return_weights=True)
+        logits = self.head(fused.squeeze(1)).squeeze(-1)
+        attn_reduced = [self._reduce_cross_attn(w, kpm) for w in w_list]
+        return logits, attn_reduced, kpm.detach(), len_audio.detach()
 
 
 def _infer_model_type_from_sd(sd: dict) -> str:
@@ -1066,6 +1135,15 @@ def main():
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--max-seq-len", type=int, default=None, help="Override max_seq_len used to cap #chunks")
 
+    p.add_argument("--dump-attn", action="store_true",
+                   help="Save reduced attention weights (rank0). Supported for llama and crossattn models.")
+    p.add_argument("--attn-out", default=None,
+                   help="Directory for attention dumps (default: <checkpoint_dir>/attn)")
+    p.add_argument("--attn-max-batches", type=int, default=50,
+                   help="Maximum number of batches to collect attention from")
+    p.add_argument("--attn-mode", default="mean_query", choices=["mean_query", "last_query"],
+                   help="How to reduce query dimension in llama self-attention dump")
+
     p.add_argument("--num-shards", type=int, default=1,
                    help="How many parallel shards to split the CSV into (usually = #GPUs).")
     p.add_argument("--shard-id", type=int, default=-1,
@@ -1104,6 +1182,8 @@ def main():
 
     print(f"Loading checkpoint: {args.checkpoint}")
     model, info = load_model_from_checkpoint(args.checkpoint, device)
+    if args.dump_attn and hasattr(model, "attn_mode"):
+        model.attn_mode = args.attn_mode
     print(
         "  model_type={mt} d_in_audio={din} audio_d_model={adm} use_aux={ua} "
         "ctx_dim={cd} rel_dim={rd} aux_dim={ad} ctx_ln={cln} rel_ln={rln} epoch={ep}".format(
@@ -1182,6 +1262,15 @@ def main():
     if not args.input_csv:
         print("ERROR: Provide --input-csv for batch mode or --p1/--p2 for single-pair mode.")
         return
+
+    dump_attn = args.dump_attn and info["model_type"] in ("llama", "crossattn")
+    if args.dump_attn and not dump_attn:
+        print(f"[WARN] --dump-attn is only supported for llama and crossattn models (got {info['model_type']}); skipping.")
+
+    if dump_attn:
+        attn_out_dir = Path(args.attn_out) if args.attn_out else Path(args.checkpoint).parent / "attn"
+        attn_out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Attention dumps → {attn_out_dir}")
 
     print(f"\nRunning batch inference on: {args.input_csv} (shard {args.shard_id}/{args.num_shards})")
     results = predict_csv(

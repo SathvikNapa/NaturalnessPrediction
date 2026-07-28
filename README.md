@@ -46,8 +46,11 @@ vox-profile-release/src/model/emotion/whisper_emotion_dim.py
 ```
 working_dir/
 ├── extract.py              # Stage 1: feature extraction
-├── train.py                # Stage 2: model training
-├── infer.py                # Stage 3: inference
+├── train.py                # Stage 2: model training (LLaMA/CrossAttn/MLP/LogReg, DDP)
+├── infer.py                # Stage 3: inference (batch CSV + optional attn dump)
+├── emotion_conversion/
+│   ├── convert_emotivoice_v2.py   # Speaker-B emotion resynthesis via EmotiVoice
+│   └── tts_shared_v2.py           # Shared audio/TTS utilities
 └── vox-profile-release/    # cloned alongside the scripts
     └── src/
         └── model/
@@ -282,6 +285,81 @@ torchrun --nproc_per_node=4 infer.py \
 `row_idx`, `p1_base`, `p2_base`, `p1_path`, `p2_path`, `label`, `augmentation_type`, `rel_detail`, `high_level_context`, `probability`, `prediction`, `logit`, `error`
 
 Rows where embeddings are missing receive `error="missing_embeddings"` rather than crashing the run.
+
+---
+
+## Pretrained Weights
+
+Trained checkpoints for the SLT ablation sweep are available at two locations.
+
+**Server (internal)**
+
+```
+/export/fs05/snapaug1/naturalness_experiments/naturalness_runs/SLT_naturalness_ablation/
+├── speech_only/
+│   ├── trace_crossencoder/best_model.pt
+│   └── trace_latefusion/best_model.pt
+├── speech_rel/
+│   ├── trace_crossencoder/best_model.pt
+│   └── trace_latefusion/best_model.pt
+├── speech_context/
+│   ├── dyadformer/best_model.pt
+│   ├── mlp/best_model.pt
+│   ├── trace_crossencoder/best_model.pt
+│   └── trace_latefusion/best_model.pt
+└── speech_context_rel/
+    ├── dyadformer/best_model.pt
+    ├── mlp/best_model.pt
+    ├── trace_crossencoder/best_model.pt
+    └── trace_latefusion/best_model.pt
+```
+
+The directory name encodes the feature ablation group (`speech_only` | `speech_rel` | `speech_context` | `speech_context_rel`) and the model architecture (`trace_crossencoder` = `crossattn`, `trace_latefusion` = `llama`, `dyadformer` = `llama`, `mlp`).
+
+**Google Drive**
+
+[Download weights from Google Drive](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing)
+
+Loading a checkpoint with `infer.py`:
+
+```bash
+python infer.py \
+    --checkpoint /export/fs05/snapaug1/.../speech_context_rel/trace_crossencoder/best_model.pt \
+    --embed-root /path/to/embeddings/embeds_vec \
+    --input-csv  data/test.csv \
+    --output-csv results/predictions.csv
+```
+
+---
+
+## Emotion Resynthesis
+
+`emotion_conversion/` contains scripts for generating AI-resynthesised speech with speaker-appropriate emotion conditioning via EmotiVoice.
+
+```
+emotion_conversion/
+├── convert_emotivoice_v2.py   # Speaker-B emotion conversion pipeline (v2)
+└── tts_shared_v2.py           # Shared audio/TTS utilities
+```
+
+**Usage**
+
+```bash
+python emotion_conversion/convert_emotivoice_v2.py \
+    --age-gender-csv /path/age_sex_predictions_merged.csv \
+    --emotion-csv    /path/emotion_predictions_merged.csv \
+    --out-root       /path/output \
+    --max-rows       5
+```
+
+**What it does**
+
+For each dyadic interaction, Speaker B's turns are replaced with EmotiVoice TTS output conditioned on:
+- F0 range and WPM from the original Speaker B recording (speaker identity cues)
+- The *opposite* emotion from Speaker A (contrastive emotion conditioning)
+- Age/gender metadata for caption building
+
+Gap-expansion packing is used so Speaker A's audio is never trimmed or stretched — if B's TTS output is longer than its original window, the gap before it expands rather than cutting into A's speech.
 
 ---
 
