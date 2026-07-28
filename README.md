@@ -29,6 +29,20 @@ Each folder contains `best_model.pt` (best validation accuracy) and `last_model.
 
 **TRACE** (Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech) is available on [Hugging Face](https://huggingface.co/datasets/SathvikNapa/TRACE). 8,434 labeled dyadic pairs split into train (5,131) and test (3,303). License: CC BY-NC 4.0.
 
+If you use this dataset, please cite:
+
+```bibtex
+@misc{ugandhar2026tracetemporalrelationshipawareconversational,
+      title={TRACE: Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech}, 
+      author={Sathvik Manikantan Napa Ugandhar and Hao Zhang and Alison Gunzler and Yuzhe Wang and Thomas Thebaud and Georgi Tinchev and Venkatesh Ravichandran and Laureano Moro-Velázquez},
+      year={2026},
+      eprint={2606.30543},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2606.30543}, 
+}
+```
+
 | Augmentation type | Description | Label | Train pairs | Test pairs |
 |---|---|:---:|:---:|:---:|
 | [`original`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/original) | Unmodified naturalistic speech | 1 — natural | 1,295 | 830 |
