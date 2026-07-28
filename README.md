@@ -52,7 +52,7 @@ Each folder contains `best_model.pt` (best validation accuracy) and `last_model.
 | Augmentation type | Description | Label | Train pairs | Test pairs |
 |---|---|:---:|:---:|:---:|
 | [`original`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/original) | Unmodified naturalistic speech | 1 — natural | 1,295 | 830 |
-| [`original_vc`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/original_vc) | Naturalistic speech with voice conversion applied | 0 — unnatural | 1,288 | 825 |
+| [`original_vc`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/original_vc) | Naturalistic speech with voice conversion applied | 1 — natural | 1,288 | 825 |
 | [`emotivoice_tts`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/emotivoice_tts) | Speaker B replaced with contrastive-emotion TTS | 0 — unnatural | 1,295 | 830 |
 | [`emotivoice_tts_vc`](https://huggingface.co/datasets/SathvikNapa/TRACE/tree/main/audio/emotivoice_tts_vc) | TTS Speaker B additionally voice-converted | 0 — unnatural | 1,253 | 818 |
 
