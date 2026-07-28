@@ -290,41 +290,37 @@ Rows where embeddings are missing receive `error="missing_embeddings"` rather th
 
 ## Pretrained Weights
 
-Trained checkpoints for the SLT ablation sweep are available at two locations.
-
-**Server (internal)**
-
-```
-/export/fs05/snapaug1/naturalness_experiments/naturalness_runs/SLT_naturalness_ablation/
-├── speech_only/
-│   ├── trace_crossencoder/best_model.pt
-│   └── trace_latefusion/best_model.pt
-├── speech_rel/
-│   ├── trace_crossencoder/best_model.pt
-│   └── trace_latefusion/best_model.pt
-├── speech_context/
-│   ├── dyadformer/best_model.pt
-│   ├── mlp/best_model.pt
-│   ├── trace_crossencoder/best_model.pt
-│   └── trace_latefusion/best_model.pt
-└── speech_context_rel/
-    ├── dyadformer/best_model.pt
-    ├── mlp/best_model.pt
-    ├── trace_crossencoder/best_model.pt
-    └── trace_latefusion/best_model.pt
-```
-
-The directory name encodes the feature ablation group (`speech_only` | `speech_rel` | `speech_context` | `speech_context_rel`) and the model architecture (`trace_crossencoder` = `crossattn`, `trace_latefusion` = `llama`, `dyadformer` = `llama`, `mlp`).
-
-**Google Drive**
-
 [Download weights from Google Drive](https://drive.google.com/drive/folders/1PeePtN-5fC_UTlnOH5Q0zsok8Mv8lQdR?usp=sharing)
+
+The archive is organised by feature ablation group and model architecture:
+
+```
+SLT_naturalness_ablation/
+├── speech_only/
+│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
+│   └── trace_latefusion/{best_model.pt, last_model.pt}
+├── speech_rel/
+│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
+│   └── trace_latefusion/{best_model.pt, last_model.pt}
+├── speech_context/
+│   ├── dyadformer/{best_model.pt, last_model.pt}
+│   ├── mlp/{best_model.pt, last_model.pt}
+│   ├── trace_crossencoder/{best_model.pt, last_model.pt}
+│   └── trace_latefusion/{best_model.pt, last_model.pt}
+└── speech_context_rel/
+    ├── dyadformer/{best_model.pt, last_model.pt}
+    ├── mlp/{best_model.pt, last_model.pt}
+    ├── trace_crossencoder/{best_model.pt, last_model.pt}
+    └── trace_latefusion/{best_model.pt, last_model.pt}
+```
+
+Directory names encode the feature set (`speech_only` | `speech_rel` | `speech_context` | `speech_context_rel`) and the model architecture (`trace_crossencoder` = `crossattn`, `trace_latefusion` = `llama`, `dyadformer` = `llama`, `mlp`).
 
 Loading a checkpoint with `infer.py`:
 
 ```bash
 python infer.py \
-    --checkpoint /export/fs05/snapaug1/.../speech_context_rel/trace_crossencoder/best_model.pt \
+    --checkpoint weights/speech_context_rel/trace_crossencoder/best_model.pt \
     --embed-root /path/to/embeddings/embeds_vec \
     --input-csv  data/test.csv \
     --output-csv results/predictions.csv
