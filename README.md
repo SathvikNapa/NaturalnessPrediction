@@ -8,6 +8,26 @@ The pipeline has three stages:
 raw WAVs  --->  feature extraction  --->  model training  --->  inference
 ```
 
+**Paper:** [arxiv.org/abs/2606.30543](https://arxiv.org/abs/2606.30543)
+
+---
+
+## Citation
+
+If you use this work (code, weights, or dataset), please cite:
+
+```bibtex
+@misc{ugandhar2026tracetemporalrelationshipawareconversational,
+      title={TRACE: Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech}, 
+      author={Sathvik Manikantan Napa Ugandhar and Hao Zhang and Alison Gunzler and Yuzhe Wang and Thomas Thebaud and Georgi Tinchev and Venkatesh Ravichandran and Laureano Moro-Velázquez},
+      year={2026},
+      eprint={2606.30543},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2606.30543}, 
+}
+```
+
 ---
 
 ## Pretrained Weights
@@ -28,20 +48,6 @@ Each folder contains `best_model.pt` (best validation accuracy) and `last_model.
 ## Dataset
 
 **TRACE** (Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech) is available on [Hugging Face](https://huggingface.co/datasets/SathvikNapa/TRACE). 8,434 labeled dyadic pairs split into train (5,131) and test (3,303). License: CC BY-NC 4.0.
-
-If you use this dataset, please cite:
-
-```bibtex
-@misc{ugandhar2026tracetemporalrelationshipawareconversational,
-      title={TRACE: Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech}, 
-      author={Sathvik Manikantan Napa Ugandhar and Hao Zhang and Alison Gunzler and Yuzhe Wang and Thomas Thebaud and Georgi Tinchev and Venkatesh Ravichandran and Laureano Moro-Velázquez},
-      year={2026},
-      eprint={2606.30543},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2606.30543}, 
-}
-```
 
 | Augmentation type | Description | Label | Train pairs | Test pairs |
 |---|---|:---:|:---:|:---:|
