@@ -1,4 +1,4 @@
-# Dyadic Naturalness Classifier
+# TRACE: Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech
 
 A pipeline for predicting whether a spoken dyadic interaction sounds **natural** (1) or **unnatural** (0). It combines sliding-window Whisper encoder embeddings with text embeddings of conversational context and speaker relationship metadata.
 
