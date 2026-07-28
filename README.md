@@ -27,7 +27,7 @@ Each folder contains `best_model.pt` (best validation accuracy) and `last_model.
 
 ## Dataset
 
-**TRACE** (Text-speech Realism and Authenticity Corpus Evaluation) is available on [Hugging Face](https://huggingface.co/datasets/SathvikNapa/TRACE). 8,434 labeled dyadic pairs split into train (5,131) and test (3,303). License: CC BY-NC 4.0.
+**TRACE** (Temporal Relationship-Aware Conversational Entrainment Detection in Dyadic Speech) is available on [Hugging Face](https://huggingface.co/datasets/SathvikNapa/TRACE). 8,434 labeled dyadic pairs split into train (5,131) and test (3,303). License: CC BY-NC 4.0.
 
 | Augmentation type | Description | Label | Train pairs | Test pairs |
 |---|---|:---:|:---:|:---:|
